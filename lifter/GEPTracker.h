@@ -1,27 +1,37 @@
 #ifndef GEPTracker_H
 #define GEPTracker_H
 
-#include "includes.h"
+#include <Zycore/Types.h>
+#include <llvm/ADT/APInt.h>
+#include <llvm/IR/Value.h>
 
 enum Assumption { Real, Assumed }; // add None
+
+enum arch_mode { X86 = 0, X64 = 1 };
 
 enum isPaged { MEMORY_PAGED, MEMORY_MIGHT_BE_PAGED, MEMORY_NOT_PAGED };
 
 struct APIntComparator {
-  bool operator()(const APInt& lhs, const APInt& rhs) const {
+  bool operator()(const llvm::APInt& lhs, const llvm::APInt& rhs) const {
     return lhs.ult(rhs); // unsigned less-than comparison
   }
 };
 
 class ValueByteReference {
 public:
-  Instruction* storeInst;
-  Value* value;
-  unsigned short byteOffset;
-  ValueByteReference() : storeInst(nullptr), value(nullptr), byteOffset(0) {}
+  // Instruction* storeInst;
+  llvm::Value* value;
+  uint8_t byteOffset;
+  // ValueByteReference() : storeInst(nullptr), value(nullptr), byteOffset(0) {}
+  ValueByteReference() : value(nullptr), byteOffset(0) {}
 
-  ValueByteReference(Instruction* inst, Value* val, short offset)
-      : storeInst(inst), value(val), byteOffset(offset) {}
+  /*
+    ValueByteReference(Instruction* inst, Value* val, short offset)
+        : storeInst(inst), value(val), byteOffset(offset) {}
+        */
+
+  ValueByteReference(llvm::Value* val, short offset)
+      : value(val), byteOffset(offset) {}
 };
 
 class ValueByteReferenceRange {
@@ -31,8 +41,6 @@ public:
     uint64_t memoryAddress;
   };
 
-  // size info, we can make this smaller because they can only be 0-8 range
-  // (maybe higher for avx)
   uint8_t start;
   uint8_t end;
 
@@ -49,15 +57,23 @@ namespace BinaryOperations {
 
   const char* getName(const uint64_t offset);
 
-  void initBases(ZyanU8* data); // ?
+  int getBitness();
+
+  void initBases(ZyanU8* data, arch_mode is64); // ?
 
   void getBases(ZyanU8** data);
 
-  bool isImport(const uint64_t addr);
+  bool isImport(uint64_t addr);
 
-  bool readMemory(const uint64_t addr, unsigned byteSize, APInt& value);
+  bool readMemory(const uint64_t addr, unsigned byteSize, llvm::APInt& value);
 
   bool isWrittenTo(const uint64_t addr);
+
+  uint64_t RvaToFileOffset(const void* ntHeadersBase, uint32_t rva);
+
+  uint64_t address_to_mapped_address(uint64_t rva);
+
+  uint64_t fileOffsetToRVA(uint64_t fileAddress);
 
 }; // namespace BinaryOperations
 

@@ -1,105 +1,132 @@
-#include "coff/section_header.hpp"
-#include "includes.h"
-#include "nt/nt_headers.hpp"
+#include "utils.h"
 #include "llvm/IR/Value.h"
+#include <chrono>
+#include <iostream>
 #include <llvm/Analysis/ValueLattice.h>
-#include <ratio>
-namespace FileHelper {
+#include <llvm/Support/KnownBits.h>
+#include <map>
 
-  static void* fileBase = nullptr;
+/*
 
-  void setFileBase(void* base) { fileBase = base; }
 
-  win::section_header_t*
-  GetEnclosingSectionHeader(uint32_t rva, win::nt_headers_x64_t* pNTHeader) {
-    auto section = pNTHeader->get_sections();
-    for (unsigned i = 0; i < pNTHeader->file_header.num_sections;
-         i++, section++) {
-      if ((rva >= section->virtual_address) &&
-          (rva < (section->virtual_address + section->virtual_size))) {
+float intBitsToFloat(int bits) {
+    // Extract components from the int using IEEE 754 single precision format
+    int sign = (bits >> 31) & 0x1;
+    int exponent = (bits >> 23) & 0xFF;
+    int mantissa = bits & 0x7FFFFF;
 
-        return section;
-      }
+    // Build float value according to IEEE 754 formula
+    float value = 0;
+    if (exponent == 0) {
+        if (mantissa == 0) {
+            value = sign ? -0.0f : 0.0f;
+        } else {
+            // Denormalized number
+            value = (sign ? -1.0f : 1.0f) * (mantissa / (float)(1 << 23)) *
+powf(2.0f, -126);
+        }
+    } else if (exponent == 0xFF) {
+        if (mantissa == 0) {
+            value = sign ? -INFINITY : INFINITY;
+        } else {
+            value = NAN;
+        }
+    } else {
+        // Normalized number
+        value = (sign ? -1.0f : 1.0f) * (1.0f + mantissa / (float)(1 << 23)) *
+powf(2.0f, exponent - 127);
     }
-    return 0;
-  }
 
-  uint64_t RvaToFileOffset(win::nt_headers_x64_t* ntHeaders, uint32_t rva) {
-    auto sectionHeader = ntHeaders->get_sections();
-    for (int i = 0; i < ntHeaders->file_header.num_sections;
-         i++, sectionHeader++) {
-      if (rva >= sectionHeader->virtual_address &&
-          rva <
-              (sectionHeader->virtual_address + sectionHeader->virtual_size)) {
-        if (sectionHeader->characteristics.mem_execute ||
-            (sectionHeader->characteristics.mem_read &&
-             !sectionHeader->characteristics.mem_write)) // remove?
-          return rva - sectionHeader->virtual_address +
-                 sectionHeader->ptr_raw_data;
-        else
-          return 0;
-      }
+    return value;
+}
+int floatBitsToInt(float f) {
+    if (f == 0.0f) {
+        return (std::signbit(f) ? 0x80000000 : 0);
     }
-    return 0;
-  }
 
-  uint64_t address_to_mapped_address(uint64_t rva) {
-    auto dosHeader = (win::dos_header_t*)fileBase;
-    auto ntHeaders =
-        (win::nt_headers_x64_t*)((uint8_t*)fileBase + dosHeader->e_lfanew);
-    auto ADDRESS = rva - ntHeaders->optional_header.image_base;
-    return RvaToFileOffset(ntHeaders, ADDRESS);
-  }
-
-  uint64_t fileOffsetToRVA(uint64_t offset) {
-    if (!fileBase)
-      return 0;
-    auto dosHeader = (win::dos_header_t*)fileBase;
-    auto ntHeaders =
-        (win::nt_headers_x64_t*)((uint8_t*)fileBase + dosHeader->e_lfanew);
-
-    auto sectionHeader = ntHeaders->get_sections();
-    for (int i = 0; i < ntHeaders->file_header.num_sections;
-         i++, sectionHeader++) {
-      if (offset >= sectionHeader->ptr_raw_data &&
-          offset <
-              (sectionHeader->ptr_raw_data + sectionHeader->size_raw_data)) {
-        return ntHeaders->optional_header.image_base + offset -
-               sectionHeader->ptr_raw_data + sectionHeader->virtual_address;
-      }
+    if (std::isinf(f)) {
+        return (f < 0 ? 0xFF800000 : 0x7F800000);
     }
-    return 0;
-  }
 
-} // namespace FileHelper
+    if (std::isnan(f)) {
+        return 0x7FC00000;  // One common NaN pattern
+    }
+
+    int sign = std::signbit(f) ? 1 : 0;
+    float abs_f = std::fabs(f);
+
+    int exponent = std::ilogbf(abs_f) + 127;  // Get biased exponent
+
+    // Handle denormals
+    if (exponent <= 0) {
+        float mantissa_f = abs_f * powf(2.0f, 149);  // 126 + 23
+        int mantissa = (int)mantissa_f;
+        return (sign << 31) | mantissa;
+    }
+
+    // Extract mantissa (23 bits of precision)
+    float mantissa_f = (abs_f / powf(2.0f, std::ilogbf(abs_f)) - 1.0f) *
+(float)(1 << 23); int mantissa = (int)mantissa_f;
+
+    return (sign << 31) | (exponent << 23) | mantissa;
+}
+
+*/
+
 namespace debugging {
   int ic = 1;
   int increaseInstCounter() { return ++ic; }
   bool shouldDebug = false;
-  void enableDebug() {
-    shouldDebug = 1;
-    cout << "Debugging enabled\n";
+  llvm::raw_ostream* debugStream = nullptr;
+  std::unique_ptr<llvm::raw_fd_ostream> fileStream;
+
+  void enableDebug(const std::string& filename = "") {
+    shouldDebug = true;
+    if (!filename.empty()) {
+      std::error_code EC;
+      fileStream = std::make_unique<llvm::raw_fd_ostream>(filename, EC);
+      if (EC) {
+        llvm::errs() << "Error opening debug file: " << EC.message() << "\n";
+        fileStream.reset();
+        debugStream = &llvm::errs();
+        shouldDebug = false;
+        return;
+      }
+      debugStream = fileStream.get();
+    } else {
+      debugStream = &llvm::outs();
+    }
+    llvm::outs() << "Debugging enabled\n";
   }
+
   void printLLVMValue(llvm::Value* v, const char* name) {
-    if (!shouldDebug)
+    if (!shouldDebug || !debugStream)
       return;
-    outs() << " " << name << " : ";
-    v->print(outs());
-    outs() << "\n";
-    outs().flush();
+    *debugStream << " " << name << " : ";
+    v->print(*debugStream);
+    *debugStream << "\n";
+    debugStream->flush();
   }
+
+  // Other functions remain the same, but use debugStream instead of
+  // llvm::outs() For example:
+  template <typename T> void printValue(const T& v, const char* name) {
+    if (!shouldDebug || !debugStream)
+      return;
+    if constexpr (std::is_same_v<T, uint8_t> || std::is_same_v<T, int8_t>) {
+      *debugStream << " " << name << " : " << static_cast<int>(v) << "\n";
+      debugStream->flush();
+      return;
+    } else
+      *debugStream << " " << name << " : " << v << "\n";
+    debugStream->flush();
+  }
+
   void doIfDebug(const std::function<void(void)>& dothis) {
     if (!shouldDebug)
       return;
     (dothis)();
   }
-  template <typename T> void printValue(const T& v, const char* name) {
-    if (!shouldDebug)
-      return;
-    outs() << " " << name << " : " << v << "\n";
-    outs().flush();
-  }
-
   template void printValue<uint64_t>(const uint64_t& v, const char* name);
   template void printValue<uint32_t>(const uint32_t& v, const char* name);
   template void printValue<uint16_t>(const uint16_t& v, const char* name);
@@ -109,14 +136,20 @@ namespace debugging {
   template void printValue<int16_t>(const int16_t& v, const char* name);
   template void printValue<int8_t>(const int8_t& v, const char* name);
   template void printValue<bool>(const bool& v, const char* name);
-  template void printValue<ValueLatticeElement>(const ValueLatticeElement& v,
+  template void printValue<std::string>(const std::string& v, const char* name);
+  template void printValue<char*>(char* const& v, const char* name);
+  template void printValue<char[256]>(char const (&)[256], const char* name);
+  template void
+  printValue<llvm::FormattedNumber>(llvm::FormattedNumber const(&),
+                                    const char* name);
+  template void
+  printValue<llvm::ValueLatticeElement>(const llvm::ValueLatticeElement& v,
+                                        const char* name);
+  template void printValue<llvm::KnownBits>(const llvm::KnownBits& v,
+                                            const char* name);
+  template void printValue<llvm::APInt>(const llvm::APInt& v, const char* name);
+  template void printValue<llvm::ConstantRange>(const llvm::ConstantRange& v,
                                                 const char* name);
-  template void printValue<KnownBits>(const KnownBits& v, const char* name);
-  template void printValue<APInt>(const APInt& v, const char* name);
-  template void printValue<ROP_info>(const ROP_info& v, const char* name);
-  template void printValue<ConstantRange>(const ConstantRange& v,
-                                          const char* name);
-
 } // namespace debugging
 
 namespace argparser {
@@ -127,8 +160,8 @@ namespace argparser {
   }
 
   std::map<std::string, std::function<void()>> options = {
-      {"-d", debugging::enableDebug},
-      {"--enable-debug", debugging::enableDebug},
+      {"-d", []() { debugging::enableDebug("debug.txt"); }},
+      //
       {"-h", printHelp}};
 
   void parseArguments(std::vector<std::string>& args) {
@@ -155,7 +188,6 @@ namespace timer {
   using duration = std::chrono::duration<double, std::milli>;
 
   time_point startTime;
-  duration elapsedTime{0};
   bool running = false;
 
   void startTimer() {
@@ -164,29 +196,24 @@ namespace timer {
   }
 
   double getTimer() {
-    elapsedTime += clock::now() - startTime;
-    return elapsedTime.count();
+    if (running) {
+      return std::chrono::duration_cast<duration>(clock::now() - startTime)
+          .count();
+    }
+    return 0.0;
   }
 
   double stopTimer() {
     if (running) {
-      elapsedTime += clock::now() - startTime;
       running = false;
+      return std::chrono::duration_cast<duration>(clock::now() - startTime)
+          .count();
     }
-    return elapsedTime.count();
+    return 0.0;
   }
 
-  void suspendTimer() {
-    if (running) {
-      elapsedTime += clock::now() - startTime;
-      running = false;
-    }
-  }
-
-  void resumeTimer() {
-    if (!running) {
-      startTime = clock::now();
-      running = true;
-    }
+  void resetTimer() {
+    startTime = clock::now();
+    running = true;
   }
 } // namespace timer

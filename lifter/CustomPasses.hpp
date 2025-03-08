@@ -4,19 +4,29 @@
 #include "GEPTracker.h"
 #include "OperandUtils.h"
 #include "includes.h"
+#include "utils.h"
 #include "llvm/IR/PassManager.h"
-#include <llvm/Analysis/WithCache.h>
+#include <llvm/Analysis/ValueTracking.h>
+#include <llvm/IR/CFG.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/Support/KnownBits.h>
+#include <llvm/Support/raw_ostream.h>
+
+#include <algorithm>
+#include <map>
+#include <string>
+
+using namespace llvm;
 
 class PromotePseudoStackPass
     : public llvm::PassInfoMixin<PromotePseudoStackPass> {
 public:
   llvm::PreservedAnalyses run(llvm::Module& M, llvm::ModuleAnalysisManager&) {
 
-    Value* memory = getMemory();
+    llvm::Value* memory = getMemory();
 
     bool hasChanged = false;
-    Value* stackMemory = NULL;
+    llvm::Value* stackMemory = NULL;
     for (auto& F : M) {
       if (!stackMemory) {
         llvm::IRBuilder<> Builder(&*F.getEntryBlock().getFirstInsertionPt());
@@ -56,9 +66,21 @@ public:
             auto StackSize = APInt(64, STACKP_VALUE);
 
             auto SSKB = KnownBits::makeConstant(StackSize);
+            printvalue2(offsetKB);
+            printvalue2(SSKB);
             if (KnownBits::ult(offsetKB, SSKB)) {
               // minimum of offsetKB
               GEP->setOperand((GEP->getNumOperands() - 2), stackMemory);
+            } else if (auto select_inst = dyn_cast<SelectInst>(OffsetOperand)) {
+              if (isa<ConstantInt>(select_inst->getFalseValue()) &&
+                  isa<ConstantInt>(select_inst->getTrueValue())) {
+                if ((cast<ConstantInt>(select_inst->getTrueValue())
+                         ->getZExtValue() < STACKP_VALUE) &&
+                    (cast<ConstantInt>(select_inst->getFalseValue())
+                         ->getZExtValue() < STACKP_VALUE)) {
+                  GEP->setOperand((GEP->getNumOperands() - 2), stackMemory);
+                }
+              }
             }
             // endif
           }
@@ -88,8 +110,8 @@ public:
             if (auto* ConstInt =
                     llvm::dyn_cast<llvm::ConstantInt>(OffsetOperand)) {
               uint64_t constintvalue = (uint64_t)ConstInt->getZExtValue();
-              if (uint64_t offset =
-                      FileHelper::address_to_mapped_address(constintvalue)) {
+              if (uint64_t offset = BinaryOperations::address_to_mapped_address(
+                      constintvalue)) {
                 for (auto* User : GEP->users()) {
                   if (auto* LoadInst = llvm::dyn_cast<llvm::LoadInst>(User)) {
                     llvm::Type* loadType = LoadInst->getType();

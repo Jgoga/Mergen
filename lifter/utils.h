@@ -1,25 +1,51 @@
 #pragma once
 #include "coff/section_header.hpp"
-#include "includes.h"
 #include "nt/nt_headers.hpp"
 #include "llvm/IR/Value.h"
 #include <cstdint>
 #include <linuxpe>
 
-namespace FileHelper {
+// #define _NODEV why?
 
-  win::section_header_t*
-  GetEnclosingSectionHeader(uint32_t rva, win::nt_headers_x64_t* pNTHeader);
+#ifndef UNREACHABLE
+#define UNREACHABLE(msg)                                                       \
+  do {                                                                         \
+                                                                               \
+    llvm::outs().flush();                                                      \
+    std::cout.flush();                                                         \
+    llvm_unreachable_internal(msg, __FILE__, __LINE__);                        \
+  } while (0)
+#endif
 
-  uint64_t RvaToFileOffset(win::nt_headers_x64_t* ntHeaders, uint32_t rva);
+#ifndef _NODEV
+#define printvalue(x)                                                          \
+  do {                                                                         \
+    debugging::printLLVMValue(x, #x);                                          \
+  } while (0);
+// outs() << " " #x " : "; x->print(outs());
+// outs() << "\n";  outs().flush();
+#define printvalue2(x)                                                         \
+  do {                                                                         \
+    debugging::printValue(x, #x);                                              \
+  } while (0);
+#else
+#define printvalue(x) ((void)0);
+#define printvalue2(x) ((void)0);
+#endif // _NODEV
 
-  uint64_t address_to_mapped_address(uint64_t rva);
+#define printvalueforce(x)                                                     \
+  do {                                                                         \
+    outs() << " " #x " : ";                                                    \
+    x->print(outs());                                                          \
+    outs() << "\n";                                                            \
+    outs().flush();                                                            \
+  } while (0);
 
-  uint64_t fileOffsetToRVA(uint64_t fileAddress);
-
-  void setFileBase(void* base);
-
-} // namespace FileHelper
+#define printvalueforce2(x)                                                    \
+  do {                                                                         \
+    outs() << " " #x " : " << x << "\n";                                       \
+    outs().flush();                                                            \
+  } while (0);
 
 namespace debugging {
   int increaseInstCounter();
@@ -37,6 +63,4 @@ namespace timer {
   void startTimer();
   double stopTimer();
   double getTimer();
-  void suspendTimer();
-  void resumeTimer();
 } // namespace timer

@@ -1,41 +1,66 @@
 #include "GEPTracker.h"
 #include "OperandUtils.h"
-#include "includes.h"
 #include "lifterClass.h"
+#include "nt/nt_headers.hpp"
+#include "utils.h"
+#include <iostream>
+#include <llvm/ADT/DenseSet.h>
 #include <llvm/Analysis/AliasAnalysis.h>
 #include <llvm/Analysis/AssumptionCache.h>
 #include <llvm/Analysis/BasicAliasAnalysis.h>
+#include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/Analysis/ValueTracking.h>
+#include <llvm/Analysis/WithCache.h>
 #include <llvm/IR/ConstantRange.h>
 #include <llvm/IR/InstrTypes.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/Support/ErrorHandling.h>
+#include <llvm/Support/KnownBits.h>
+#include <llvm/TargetParser/Triple.h>
+#include <llvm/Transforms/Utils/SCCPSolver.h>
 
 namespace BinaryOperations {
 
   // wtf man
   ZyanU8* data_g;
+  arch_mode is64Bit;
 
-  void initBases(ZyanU8* data) { data_g = data; }
+  void initBases(ZyanU8* data, arch_mode is64) {
+    data_g = data;
+    is64Bit = is64;
+  }
 
+  int getBitness() { return is64Bit == X64 ? 64 : 32; }
   void getBases(ZyanU8** data) { *data = data_g; }
 
   const char* getName(uint64_t offset) {
     auto dosHeader = (win::dos_header_t*)data_g;
-    auto ntHeaders =
-        (win::nt_headers_x64_t*)((uint8_t*)data_g + dosHeader->e_lfanew);
-    auto rvaOffset = FileHelper::RvaToFileOffset(ntHeaders, offset);
+    auto ntHeaders = (const void*)((uint8_t*)data_g + dosHeader->e_lfanew);
+    auto rvaOffset = RvaToFileOffset(ntHeaders, offset);
     return (const char*)data_g + rvaOffset;
   }
+
   bool isImport(uint64_t addr) {
+    auto dosHeader = reinterpret_cast<const win::dos_header_t*>(data_g);
+    auto ntHeadersBase =
+        reinterpret_cast<const uint8_t*>(data_g) + dosHeader->e_lfanew;
+
+    uint64_t imageBase;
+    if (is64Bit == X64) {
+      auto ntHeaders =
+          reinterpret_cast<const win::nt_headers_t<true>*>(ntHeadersBase);
+      imageBase = ntHeaders->optional_header.image_base;
+    } else {
+      auto ntHeaders =
+          reinterpret_cast<const win::nt_headers_t<false>*>(ntHeadersBase);
+      imageBase = ntHeaders->optional_header.image_base;
+    }
+
     APInt tmp;
-    auto dosHeader = (win::dos_header_t*)data_g;
-    auto ntHeaders =
-        (win::nt_headers_x64_t*)((uint8_t*)data_g + dosHeader->e_lfanew);
-    return readMemory(ntHeaders->optional_header.image_base + addr, 1, tmp);
+    return readMemory(imageBase + addr, 1, tmp);
   }
 
-  unordered_set<uint64_t> MemWrites;
+  DenseSet<uint64_t> MemWrites;
 
   bool isWrittenTo(uint64_t addr) {
     return MemWrites.find(addr) != MemWrites.end();
@@ -45,9 +70,8 @@ namespace BinaryOperations {
   // sections
   bool readMemory(uint64_t addr, unsigned byteSize, APInt& value) {
 
-    uint64_t mappedAddr = FileHelper::address_to_mapped_address(addr);
+    uint64_t mappedAddr = address_to_mapped_address(addr);
     uint64_t tempValue;
-
     if (mappedAddr > 0) {
       std::memcpy(&tempValue,
                   reinterpret_cast<const void*>(data_g + mappedAddr), byteSize);
@@ -66,23 +90,115 @@ namespace BinaryOperations {
   // we will be executing
   void writeMemory();
 
+  uint64_t RvaToFileOffset(const void* ntHeadersBase, uint32_t rva) {
+    const auto* sectionHeader =
+        is64Bit == X64
+            ? reinterpret_cast<const win::nt_headers_t<true>*>(ntHeadersBase)
+                  ->get_sections()
+            : reinterpret_cast<const win::nt_headers_t<false>*>(ntHeadersBase)
+                  ->get_sections();
+
+    int numSections =
+        is64Bit == X64
+            ? reinterpret_cast<const win::nt_headers_t<true>*>(ntHeadersBase)
+                  ->file_header.num_sections
+            : reinterpret_cast<const win::nt_headers_t<false>*>(ntHeadersBase)
+                  ->file_header.num_sections;
+
+    for (int i = 0; i < numSections; i++, sectionHeader++) {
+      if (rva >= sectionHeader->virtual_address &&
+          rva <
+              (sectionHeader->virtual_address + sectionHeader->virtual_size)) {
+        return rva - sectionHeader->virtual_address +
+               sectionHeader->ptr_raw_data;
+      }
+    }
+    return 0;
+  }
+
+  uint64_t address_to_mapped_address(uint64_t rva) {
+    auto dosHeader = reinterpret_cast<const win::dos_header_t*>(data_g);
+    auto ntHeadersBase =
+        reinterpret_cast<const uint8_t*>(data_g) + dosHeader->e_lfanew;
+
+    uint64_t imageBase;
+    if (is64Bit == X64) {
+      auto ntHeaders =
+          reinterpret_cast<const win::nt_headers_t<true>*>(ntHeadersBase);
+      imageBase = ntHeaders->optional_header.image_base;
+    } else {
+      auto ntHeaders =
+          reinterpret_cast<const win::nt_headers_t<false>*>(ntHeadersBase);
+      imageBase = ntHeaders->optional_header.image_base;
+    }
+
+    uint64_t address = rva - imageBase;
+    return RvaToFileOffset(ntHeadersBase, address);
+  }
+
+  uint64_t fileOffsetToRVA(uint64_t offset) {
+    if (!data_g) {
+      return 0; // Ensure data is initialized
+    }
+
+    // Get DOS header
+    auto dosHeader = reinterpret_cast<const win::dos_header_t*>(data_g);
+    auto ntHeadersBase =
+        reinterpret_cast<const uint8_t*>(data_g) + dosHeader->e_lfanew;
+
+    // Determine NT headers based on architecture
+    uint64_t imageBase;
+    auto sectionHeader =
+        is64Bit == X64
+            ? reinterpret_cast<const win::nt_headers_t<true>*>(ntHeadersBase)
+                  ->get_sections()
+            : reinterpret_cast<const win::nt_headers_t<false>*>(ntHeadersBase)
+                  ->get_sections();
+
+    int numSections =
+        is64Bit == X64
+            ? reinterpret_cast<const win::nt_headers_t<true>*>(ntHeadersBase)
+                  ->file_header.num_sections
+            : reinterpret_cast<const win::nt_headers_t<false>*>(ntHeadersBase)
+                  ->file_header.num_sections;
+
+    imageBase =
+        is64Bit == X64
+            ? reinterpret_cast<const win::nt_headers_t<true>*>(ntHeadersBase)
+                  ->optional_header.image_base
+            : reinterpret_cast<const win::nt_headers_t<false>*>(ntHeadersBase)
+                  ->optional_header.image_base;
+
+    // Iterate over section headers to find matching section
+    for (int i = 0; i < numSections; i++, sectionHeader++) {
+      if (offset >= sectionHeader->ptr_raw_data &&
+          offset <
+              (sectionHeader->ptr_raw_data + sectionHeader->size_raw_data)) {
+        return imageBase + offset - sectionHeader->ptr_raw_data +
+               sectionHeader->virtual_address;
+      }
+    }
+
+    return 0; // Offset not found in any section
+  }
+
 }; // namespace BinaryOperations
 
-void lifterClass::addValueReference(Instruction* inst, Value* value,
-                                    uint64_t address) {
+void lifterClass::addValueReference(Value* value, uint64_t address) {
   unsigned valueSizeInBytes = value->getType()->getIntegerBitWidth() / 8;
   for (unsigned i = 0; i < valueSizeInBytes; i++) {
 
     BinaryOperations::WriteTo(address + i);
     printvalue2(address + i);
-    buffer[address + i] = ValueByteReference(inst, value, i);
+    buffer[address + i] = ValueByteReference(value, i);
     printvalue(value);
     printvalue2((uint64_t)address + i);
   }
 }
 
 Value* lifterClass::retrieveCombinedValue(uint64_t startAddress,
-                                          uint8_t byteCount, Value* orgLoad) {
+                                          uint8_t byteCount,
+                                          LazyValue orgLoad) {
   LLVMContext& context = builder.getContext();
   if (byteCount == 0) {
     return nullptr;
@@ -94,18 +210,22 @@ Value* lifterClass::retrieveCombinedValue(uint64_t startAddress,
   for (uint8_t i = 0; i < byteCount; ++i) {
     uint64_t currentAddress = startAddress + i;
 
-    // push if
-    if (values.empty() || // empty or
-        (buffer.contains(currentAddress) &&
-         values.back().isRef && // ( its a reference
-         (values.back().ref.value !=
-              buffer[currentAddress].value || // and references are not same or
-          values.back().ref.byteOffset !=
-              buffer[currentAddress].byteOffset - values.back().end +
-                  values.back().start)) //  reference offset is not directly
-                                        //  next value )
-    ) {
+    auto isDifferentReferenceOrDiscontinuousOffset =
+        [this](const ValueByteReferenceRange& lastRef,
+               uint64_t currentAddress) {
+          const auto& currentValue = buffer[currentAddress];
+          return lastRef.ref.value != currentValue.value ||
+                 lastRef.ref.byteOffset !=
+                     currentValue.byteOffset - (lastRef.end - lastRef.start);
+        };
 
+    bool isEmpty = values.empty();
+    bool isContained = buffer.contains(currentAddress);
+    bool isLastReference = !isEmpty && values.back().isRef;
+    // push if
+    if (isEmpty || (isContained && isLastReference &&
+                    isDifferentReferenceOrDiscontinuousOffset(
+                        values.back(), currentAddress))) {
       if (buffer.contains(currentAddress)) {
         values.push_back(
             ValueByteReferenceRange(buffer[currentAddress], i, i + 1));
@@ -133,7 +253,12 @@ Value* lifterClass::retrieveCombinedValue(uint64_t startAddress,
       byteValue = builder.getIntN(bytesize * 8, mem_value.getZExtValue());
     } else if (!v.isRef) {
       // llvm_unreachable_internal("uh...");
-      byteValue = extractBytes(orgLoad, m, m + bytesize);
+	  /*
+      byteValue = ConstantInt::get(Type::getIntNTy(context, (bytesize) * 8),
+                                   v.memoryAddress);
+	  */
+      // TODO :
+      byteValue = extractBytes(orgLoad.get(), m, m + bytesize);
     }
     if (byteValue) {
       printvalue(byteValue);
@@ -175,8 +300,8 @@ Value* lifterClass::extractBytes(Value* value, uint8_t startOffset,
   printvalue(value);
   printvalue(shiftedValue);
 
-  Value* truncatedValue =
-      createTruncFolder(shiftedValue, Type::getIntNTy(context, byteCount * 8));
+  Value* truncatedValue = createZExtOrTruncFolder(
+      shiftedValue, Type::getIntNTy(context, byteCount * 8));
   return truncatedValue;
 }
 
@@ -252,7 +377,14 @@ void lifterClass::pagedCheck(Value* address, Instruction* ctxI) {
   switch (paged) {
   case MEMORY_NOT_PAGED: {
     printvalueforce(address);
-    cout.flush();
+    printvalueforce2(instruction.mnemonic);
+    printvalueforce2(blockInfo.runtime_address);
+    debugging::doIfDebug([&]() {
+      std::string Filename = "output_paged_error.ll";
+      std::error_code EC;
+      raw_fd_ostream OS(Filename, EC);
+      builder.GetInsertBlock()->getParent()->getParent()->print(OS, nullptr);
+    });
     UNREACHABLE("\nmemory is not paged, so we(more likely) or the program "
                 "probably do some incorrect stuff "
                 "we abort to avoid incorrect output\n");
@@ -269,8 +401,7 @@ void lifterClass::pagedCheck(Value* address, Instruction* ctxI) {
   }
 }
 
-void lifterClass::loadMemoryOp(LoadInst* inst) {
-  auto ptr = inst->getPointerOperand();
+void lifterClass::loadMemoryOp(Value* ptr) {
   if (!isa<GetElementPtrInst>(ptr))
     return;
 
@@ -281,7 +412,7 @@ void lifterClass::loadMemoryOp(LoadInst* inst) {
 
   auto gepOffset = gepInst->getOperand(1);
 
-  pagedCheck(gepOffset, inst);
+  pagedCheck(gepOffset, dyn_cast<Instruction>(ptr));
   return;
 }
 
@@ -302,14 +433,39 @@ void lifterClass::insertMemoryOp(StoreInst* inst) {
 
   pagedCheck(gepOffset, inst);
 
-  if (!isa<ConstantInt>(gepOffset)) // we also want to do operations with the
-                                    // memory when we can assume a range or
-                                    // writing to an unk location (ofc paged)
+  if (!isa<ConstantInt>(gepOffset)) {
+    printvalue(gepOffset);
+    if (auto conditional_offset = dyn_cast<SelectInst>(gepOffset)) {
+      printvalue(conditional_offset->getFalseValue());
+      printvalue(conditional_offset->getCondition());
+      if (auto truev =
+              dyn_cast<ConstantInt>(conditional_offset->getTrueValue())) {
+        auto newinst = createSelectFolder(
+            conditional_offset->getCondition(), inst->getValueOperand(),
+            retrieveCombinedValue(
+                truev->getZExtValue(),
+                inst->getValueOperand()->getType()->getIntegerBitWidth() / 8,
+                nullptr));
+        addValueReference(newinst, truev->getZExtValue());
+      }
+      if (auto falsev =
+              dyn_cast<ConstantInt>(conditional_offset->getFalseValue())) {
+        auto newinst = createSelectFolder(
+            conditional_offset->getCondition(),
+            retrieveCombinedValue(
+                falsev->getZExtValue(),
+                inst->getValueOperand()->getType()->getIntegerBitWidth() / 8,
+                nullptr),
+            inst->getValueOperand());
+        addValueReference(newinst, falsev->getZExtValue());
+      }
+    }
     return;
+  }
 
   auto gepOffsetCI = cast<ConstantInt>(gepOffset);
 
-  addValueReference(inst, inst->getValueOperand(), gepOffsetCI->getZExtValue());
+  addValueReference(inst->getValueOperand(), gepOffsetCI->getZExtValue());
   BinaryOperations::WriteTo(gepOffsetCI->getZExtValue());
 }
 
@@ -382,10 +538,21 @@ void removeDuplicateOffsets(vector<Instruction*>& vec) {
   vec.assign(uniqueInstructions.rbegin(), uniqueInstructions.rend());
 }
 
-set<APInt, APIntComparator> getPossibleValues(const llvm::KnownBits& known,
-                                              unsigned max_unknown) {
-  if (max_unknown >= 16) {
-    UNREACHABLE("There is a very huge chance that this shouldnt happen");
+set<APInt, APIntComparator>
+lifterClass::getPossibleValues(const llvm::KnownBits& known,
+                               unsigned max_unknown) {
+
+  if ((max_unknown == 0) || (max_unknown >= 4)) {
+    debugging::doIfDebug([&]() {
+      std::string Filename = "output_too_many_unk.ll";
+      std::error_code EC;
+      raw_fd_ostream OS(Filename, EC);
+      builder.GetInsertBlock()->getParent()->getParent()->print(OS, nullptr);
+    });
+    printvalueforce2(max_unknown);
+    UNREACHABLE(
+        "We cant solve the address because too many potential values! "
+        "This shouldn't happen, maybe calculate some kind of a range ?");
   }
   llvm::APInt base = known.One;
   llvm::APInt unknowns = ~(known.Zero | known.One);
@@ -540,7 +707,14 @@ calculatePossibleValues(std::set<APInt, APIntComparator> v1,
 
 set<APInt, APIntComparator> lifterClass::computePossibleValues(Value* V,
                                                                uint8_t Depth) {
+  printvalue2(Depth);
   if (Depth > 16) {
+    debugging::doIfDebug([&]() {
+      std::string Filename = "output_depth_exceeded.ll";
+      std::error_code EC;
+      raw_fd_ostream OS(Filename, EC);
+      builder.GetInsertBlock()->getParent()->getParent()->print(OS, nullptr);
+    });
     UNREACHABLE("Depth exceeded");
   }
   set<APInt, APIntComparator> res;
@@ -555,14 +729,31 @@ set<APInt, APIntComparator> lifterClass::computePossibleValues(Value* V,
       return computePossibleValues(v_inst->getOperand(0), Depth + 1);
 
     if (v_inst->getOpcode() == Instruction::Select) {
+      auto cond = v_inst->getOperand(0);
       auto trueValue = v_inst->getOperand(1);
       auto falseValue = v_inst->getOperand(2);
 
-      auto trueValues = computePossibleValues(trueValue, Depth + 1);
-      auto falseValues = computePossibleValues(falseValue, Depth + 1);
+      auto kb = analyzeValueKnownBits(cond, v_inst);
+      printvalue2(kb);
 
+      if (kb.isZero()) {
+        auto falseValues = computePossibleValues(falseValue, Depth + 1);
+
+        res.insert(falseValues.begin(), falseValues.end());
+        return res;
+      }
+      if (kb.isNonZero()) {
+        auto falseValues = computePossibleValues(falseValue, Depth + 1);
+
+        res.insert(falseValues.begin(), falseValues.end());
+        return res;
+      }
+      auto trueValues = computePossibleValues(trueValue, Depth + 1);
       // Combine all possible values from both branches
       res.insert(trueValues.begin(), trueValues.end());
+
+      auto falseValues = computePossibleValues(falseValue, Depth + 1);
+
       res.insert(falseValues.begin(), falseValues.end());
       return res;
     }
@@ -578,13 +769,14 @@ set<APInt, APIntComparator> lifterClass::computePossibleValues(Value* V,
     printvalue2(analyzeValueKnownBits(V, v_inst));
     auto v_knownbits = analyzeValueKnownBits(v_inst, v_inst);
     unsigned int res_unknownbits_count =
-        llvm::popcount(~(v_knownbits.One | v_knownbits.Zero).getZExtValue());
+        llvm::popcount(~(v_knownbits.One | v_knownbits.Zero).getZExtValue()) -
+        64 + v_knownbits.getBitWidth();
 
     auto total_unk = ~((op1_knownbits.One | op1_knownbits.Zero) &
                        (op2_knownbits.One | op2_knownbits.Zero));
 
     unsigned int total_unknownbits_count =
-        llvm::popcount(total_unk.getZExtValue());
+        llvm::popcount(total_unk.getZExtValue()) - 64 + total_unk.getBitWidth();
     printvalue2(v_knownbits);
     printvalue2(op1_knownbits);
     printvalue2(op2_knownbits);
@@ -617,23 +809,16 @@ set<APInt, APIntComparator> lifterClass::computePossibleValues(Value* V,
   return res;
 }
 
-Value* lifterClass::solveLoad(LoadInst* load) {
-  printvalue(load);
+Value* lifterClass::solveLoad(LazyValue load, Value* ptr, uint8_t size) {
 
-  // replace this
-  auto LoadMemLoc = MemoryLocation::get(load);
+  const Value* loadPtr = ptr;
 
-  const Value* loadPtr = LoadMemLoc.Ptr;
-  LocationSize loadsize = LoadMemLoc.Size;
-
-  auto cloadsize = loadsize.getValue();
-
+  auto cloadsize = size / 8;
   auto loadPtrGEP = cast<GetElementPtrInst>(loadPtr);
-
   auto loadPointer = loadPtrGEP->getPointerOperand();
-  auto loadOffset = loadPtrGEP->getOperand(1);
-  printvalue(loadOffset);
+  Value* loadOffset = loadPtrGEP->getOperand(1);
 
+  printvalue(loadOffset);
   // if we know all the stores, we can use our buffer
   // however, if we dont know all the stores
   // we have to if check each store overlaps with our load
@@ -666,161 +851,9 @@ Value* lifterClass::solveLoad(LoadInst* load) {
                 cast<ConstantInt>(select_inst->getFalseValue())->getZExtValue(),
                 cloadsize, load));
     }
-    auto possibleValues = computePossibleValues(loadOffset, 0);
-
-    llvm::Value* selectedValue = nullptr;
-
-    for (auto possibleValue : possibleValues) { // rename
-
-      auto isPaged = isMemPaged(possibleValue.getZExtValue());
-      if (!isPaged)
-        continue;
-      printvalue2(possibleValue);
-      auto possible_values_from_mem =
-          retrieveCombinedValue(possibleValue.getZExtValue(), cloadsize, load);
-      printvalue2((uint64_t)cloadsize);
-      printvalue(possible_values_from_mem);
-
-      if (selectedValue == nullptr) {
-        selectedValue = possible_values_from_mem;
-      } else {
-
-        llvm::Value* comparison = createICMPFolder(
-            CmpInst::ICMP_EQ, loadOffset,
-            llvm::ConstantInt::get(loadOffset->getType(), possibleValue));
-        printvalue(comparison);
-        selectedValue =
-            createSelectFolder(comparison, possible_values_from_mem,
-                               selectedValue, "conditional-mem-load");
-      }
-    }
-    return selectedValue;
   }
 
-  // create a new vector with only leave what we care about
-  vector<Instruction*> clearedMemInfos;
-
-  clearedMemInfos = memInfos;
-  removeDuplicateOffsets(clearedMemInfos);
-
-  Value* retval = nullptr;
-
-  for (auto inst : clearedMemInfos) {
-
-    // we are only interested in previous instructions
-
-    // replace it with something more efficent
-    // auto MemLoc = MemoryLocation::get(inst);
-
-    StoreInst* storeInst = cast<StoreInst>(inst);
-    auto memLocationValue = storeInst->getPointerOperand();
-
-    auto memLocationGEP = cast<GetElementPtrInst>(memLocationValue);
-
-    auto pointer = memLocationGEP->getOperand(0);
-    auto offset = memLocationGEP->getOperand(1);
-
-    if (pointer != loadPointer)
-      break;
-
-    // find a way to compare with unk values, we are also interested
-    // when offset in unk ( should be a rare case )
-    if (!isa<ConstantInt>(offset) || !isa<ConstantInt>(loadOffset))
-      continue;
-
-    uint64_t memOffsetValue = cast<ConstantInt>(offset)->getZExtValue();
-    uint64_t loadOffsetValue = cast<ConstantInt>(loadOffset)->getZExtValue();
-
-    uint64_t diff = memOffsetValue - loadOffsetValue;
-
-    // this is bytesize, not bitsize
-    uint64_t storeBitSize =
-        storeInst->getValueOperand()->getType()->getIntegerBitWidth() / 8;
-
-    if (overlaps(loadOffsetValue, cloadsize, memOffsetValue, storeBitSize)) {
-
-      printvalue2(diff) printvalue2(memOffsetValue);
-      printvalue2(loadOffsetValue) printvalue2(storeBitSize);
-
-      auto storedInst = inst->getOperand(0);
-      if (!retval)
-        retval = ConstantInt::get(load->getType(), 0);
-
-      Value* mask = ConstantInt::get(
-          storedInst->getType(),
-          createmask(loadOffsetValue, loadOffsetValue + cloadsize,
-                     memOffsetValue, memOffsetValue + storeBitSize));
-
-      printvalue(mask);
-
-      // we dont have to calculate knownbits if its a constant
-      auto maskedinst =
-          createAndFolder(storedInst, mask, inst->getName() + ".maskedinst");
-
-      printvalue(storedInst);
-      printvalue(mask);
-      printvalue(maskedinst);
-      if (maskedinst->getType()->getScalarSizeInBits() <
-          retval->getType()->getScalarSizeInBits())
-        maskedinst = builder.CreateZExt(maskedinst, retval->getType());
-
-      if (mask->getType()->getScalarSizeInBits() <
-          retval->getType()->getScalarSizeInBits())
-        mask = builder.CreateZExt(mask, retval->getType());
-
-      printvalue(maskedinst);
-      printvalue2(diff);
-      // move the mask?
-      if (diff > 0) {
-        maskedinst = createShlFolder(maskedinst, (diff) * 8);
-        mask = createShlFolder(mask, (diff) * 8);
-      } else if (diff < 0) {
-        maskedinst = createLShrFolder(maskedinst, -(diff) * 8, "clevername");
-        mask = createLShrFolder(mask, -(diff) * 8, "stupidname");
-      }
-      // maskedinst = maskedinst
-      // maskedinst = 0x4433221100000000
-      printvalue(maskedinst);
-      maskedinst = builder.CreateZExtOrTrunc(maskedinst, retval->getType());
-      printvalue(maskedinst);
-
-      printvalue(mask);
-
-      // clear mask from retval so we can merge
-      // this will be a NOT operation for sure
-
-      auto reverseMask = builder.CreateNot(mask);
-
-      printvalue(reverseMask);
-
-      auto cleared_retval = createAndFolder(
-          retval, builder.CreateTrunc(reverseMask, retval->getType()),
-          retval->getName() + ".cleared");
-      // cleared_retval = 0 & 0; clear retval
-      // cleared_retval = retval & 0xff_ff_ff_ff_00_00_00_00
-
-      retval = createOrFolder(cleared_retval, maskedinst,
-                              cleared_retval->getName() + ".merged");
-      // retval = builder.CreateTrunc(retval, load->getType());
-      printvalue(cleared_retval);
-      printvalue(maskedinst);
-      // retval = cleared_retval | maskedinst =|= 0 |
-      // 0x1122334455667788 retval = cleared_retval | maskedinst =|=
-      // 0x55667788 | 0x4433221100000000
-
-      if (retval)
-        if (retval->getType()->getScalarSizeInBits() >
-            load->getType()->getScalarSizeInBits())
-          retval = builder.CreateTrunc(retval, load->getType());
-
-      printvalue(inst);
-      auto retvalload = retval;
-      printvalue(cleared_retval);
-      printvalue(retvalload);
-      debugging::doIfDebug([&]() { cout << "-------------------\n"; });
-    }
-  }
-  return retval;
+  return nullptr;
 }
 
 // some stuff about memory
