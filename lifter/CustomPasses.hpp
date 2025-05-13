@@ -8,6 +8,7 @@
 #include "llvm/IR/PassManager.h"
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/CFG.h>
+#include <llvm/IR/Function.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/Support/KnownBits.h>
 #include <llvm/Support/raw_ostream.h>
@@ -18,16 +19,88 @@
 
 using namespace llvm;
 
+class BasicBlockDotGraphPass
+    : public llvm::PassInfoMixin<BasicBlockDotGraphPass> {
+public:
+  PreservedAnalyses run(llvm::Module& M, llvm::ModuleAnalysisManager&) {
+    std::string filename = M.getName().str() + ".dot";
+    llvm::outs() << filename << "\n";
+    std::error_code EC;
+    raw_fd_ostream fileStream(filename, EC);
+    if (EC) {
+      llvm::errs() << "Could not open file: " << EC.message() << "\n";
+      return llvm::PreservedAnalyses::all();
+    }
+
+    fileStream << "digraph \"" << M.getName().str() << "\" {\n";
+
+    std::map<const BasicBlock*, std::string> bbNames;
+    int bbCount = 0;
+
+    for (const auto& F : M) {
+      for (const BasicBlock& BB : F) {
+        std::string sanitizedName;
+
+        llvm::StringRef nameRef = BB.getName();
+
+        if (nameRef.count('-') >= 2) {
+          size_t firstHyphen = nameRef.find('-');
+          size_t secondHyphen = nameRef.find('-', firstHyphen + 1);
+
+          if (secondHyphen != llvm::StringRef::npos) {
+            llvm::StringRef extracted = nameRef.substr(0, secondHyphen);
+
+            std::string extractedStr = extracted.str();
+
+            if (!extractedStr.empty()) {
+              extractedStr.pop_back();
+            }
+
+            std::replace(extractedStr.begin(), extractedStr.end(), '-', '_');
+
+            sanitizedName = "BB" + extractedStr;
+          } else {
+            sanitizedName = "BBentry";
+          }
+        } else {
+          sanitizedName = "BBentry";
+        }
+
+        bbNames[&BB] = sanitizedName;
+
+        fileStream << "    \"" << sanitizedName << "\" [label=\""
+                   << sanitizedName << "\"];\n";
+      }
+
+      for (const BasicBlock& BB : F) {
+        for (const auto SI : successors(&BB)) {
+          auto Succ = SI;
+          fileStream << "    " << bbNames[&BB] << " -> " << bbNames[Succ]
+                     << ";\n";
+        }
+      }
+    }
+
+    fileStream << "}\n";
+
+    fileStream.close();
+    errs() << "Generated DOT file for function: " << M.getName() << "\n";
+
+    return PreservedAnalyses::all();
+  }
+};
+
 class PromotePseudoStackPass
     : public llvm::PassInfoMixin<PromotePseudoStackPass> {
 public:
+  Value* mem = nullptr;
+  PromotePseudoStackPass(Value* val) : mem(val){};
   llvm::PreservedAnalyses run(llvm::Module& M, llvm::ModuleAnalysisManager&) {
-
-    llvm::Value* memory = getMemory();
 
     bool hasChanged = false;
     llvm::Value* stackMemory = NULL;
     for (auto& F : M) {
+      llvm::Value* memory = mem;
       if (!stackMemory) {
         llvm::IRBuilder<> Builder(&*F.getEntryBlock().getFirstInsertionPt());
         stackMemory = Builder.CreateAlloca(
@@ -42,9 +115,10 @@ public:
 
             // TODO: prettify here!!!
             auto* MemoryOperand = GEP->getOperand(GEP->getNumOperands() - 2);
-            // printvalue(MemoryOperand)
-            // printvalue(memory)
-
+            /*
+              printvalueforce(MemoryOperand);
+              printvalueforce(memory);
+            */
             if (memory != MemoryOperand)
               continue;
 
@@ -95,9 +169,10 @@ public:
 // refactor
 class GEPLoadPass : public llvm::PassInfoMixin<GEPLoadPass> {
 public:
-  ZyanU8* data;
+  uint8_t* filebase;
 
-  GEPLoadPass() { BinaryOperations::getBases(&data); }
+  Value* mem = nullptr;
+  GEPLoadPass(Value* val, uint8_t* filebase) : mem(val), filebase(filebase){};
 
   llvm::PreservedAnalyses run(llvm::Module& M, llvm::ModuleAnalysisManager&) {
     bool hasChanged = false;
@@ -119,9 +194,10 @@ public:
                     unsigned byteSize = loadType->getIntegerBitWidth() / 8;
                     uint64_t tempvalue;
 
-                    std::memcpy(&tempvalue,
-                                reinterpret_cast<const void*>(data + offset),
-                                byteSize);
+                    std::memcpy(
+                        &tempvalue,
+                        reinterpret_cast<const void*>(filebase + offset),
+                        byteSize);
 
                     llvm::APInt readValue(byteSize * 8, tempvalue);
                     llvm::Constant* newVal =
@@ -195,13 +271,15 @@ to
 */
 class PromotePseudoMemory : public llvm::PassInfoMixin<PromotePseudoMemory> {
 public:
+  Value* mem = nullptr;
+  PromotePseudoMemory(Value* val) : mem(val){};
   llvm::PreservedAnalyses run(llvm::Module& M, llvm::ModuleAnalysisManager&) {
 
     std::vector<llvm::Instruction*> toPromote;
-    Value* memory = getMemory();
 
     bool hasChanged = false;
     for (auto& F : M) {
+      Value* memory = mem;
       for (auto& BB : F) {
         for (auto& I : BB) {
           if (auto* GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(&I)) {
